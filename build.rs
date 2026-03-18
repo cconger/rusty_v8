@@ -49,9 +49,20 @@ fn main() {
     "EXTRA_GN_ARGS",
     "PRINT_GN_ARGS",
     "CARGO_ENCODED_RUSTFLAGS",
+    "PYTHONSAFEPATH",
+    "RUSTY_V8_MUSL_ARCH_INCLUDE_DIR",
+    "RUSTY_V8_MUSL_INCLUDE_DIR",
+    "RUSTY_V8_MUSL_LIB_DIR",
+    "RUSTY_V8_MUSL_SYSTEM_INCLUDE_DIR",
   ];
   for env in envs {
     println!("cargo:rerun-if-env-changed={env}");
+  }
+
+  if env::var_os("PYTHONSAFEPATH").is_some() {
+    unsafe {
+      env::remove_var("PYTHONSAFEPATH");
+    }
   }
 
   // Detect if trybuild tests are being compiled.
@@ -261,11 +272,18 @@ fn build_v8(is_asan: bool) {
   // are the officially approach to get the target os/arch in build.rs.
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
+  let use_musl = target_os == "linux" && target_env == "musl";
   // On windows, rustc cannot link with a V8 debug build.
-  let mut gn_args = if is_debug() && target_os != "windows" {
+  let mut gn_args = if is_debug() && target_os != "windows" && !use_musl {
     // Note: When building for Android aarch64-qemu, use release instead of debug.
     vec!["is_debug=true".to_string()]
   } else {
+    if use_musl && is_debug() {
+      println!(
+        "cargo:warning=musl source builds currently use a release V8 build"
+      );
+    }
     vec!["is_debug=false".to_string()]
   };
   if is_asan {
@@ -325,10 +343,20 @@ fn build_v8(is_asan: bool) {
     gn_args.push("is_clang=false".into());
     // -gline-tables-only is Clang-only
     gn_args.push("line_tables_only=false".into());
-  } else if let Some(clang_base_path) = find_compatible_system_clang() {
+  } else if !use_musl
+    && let Some(clang_base_path) = find_compatible_system_clang()
+  {
     println!("clang_base_path (system): {}", clang_base_path.display());
     gn_args.push(format!("clang_base_path={clang_base_path:?}"));
+    if let Some(clang_version) = system_clang_version(&clang_base_path) {
+      println!("clang_version (system): {clang_version}");
+      gn_args.push(format!(r#"clang_version="{clang_version}""#));
+    }
     gn_args.push("treat_warnings_as_errors=false".to_string());
+  } else if use_musl {
+    println!("using Chromium's clang for musl");
+    let clang_base_path = clang_download();
+    gn_args.push(format!("clang_base_path={clang_base_path:?}"));
   } else {
     println!("using Chromium's clang");
     let clang_base_path = clang_download();
@@ -357,9 +385,44 @@ fn build_v8(is_asan: bool) {
     }
   }
   // cross-compilation setup
+  if target_os == "linux" && target_env == "musl" {
+    assert_eq!(
+      target_arch, "x86_64",
+      "rusty_v8 musl support currently only targets x86_64"
+    );
+    let musl_include_dir = env::var("RUSTY_V8_MUSL_INCLUDE_DIR")
+      .unwrap_or_else(|_| "/usr/include/x86_64-linux-musl".to_string());
+    let musl_system_include_dir = env::var("RUSTY_V8_MUSL_SYSTEM_INCLUDE_DIR")
+      .unwrap_or_else(|_| "/usr/include".to_string());
+    let musl_arch_include_dir = env::var("RUSTY_V8_MUSL_ARCH_INCLUDE_DIR")
+      .unwrap_or_else(|_| "/usr/include/x86_64-linux-gnu".to_string());
+    let musl_lib_dir = env::var("RUSTY_V8_MUSL_LIB_DIR")
+      .unwrap_or_else(|_| "/usr/lib/x86_64-linux-musl".to_string());
+    let musl_libcpp_config_site = write_musl_libcpp_config_site();
+    gn_args.push(r#"target_cpu="x64""#.to_string());
+    gn_args.push("use_sysroot=false".to_string());
+    gn_args.push("rusty_v8_use_musl=true".to_string());
+    gn_args.push(format!(r#"rusty_v8_musl_include_dir={musl_include_dir:?}"#));
+    gn_args.push(format!(
+      r#"rusty_v8_musl_system_include_dir={musl_system_include_dir:?}"#
+    ));
+    gn_args.push(format!(
+      r#"rusty_v8_musl_arch_include_dir={musl_arch_include_dir:?}"#
+    ));
+    gn_args.push(format!(r#"rusty_v8_musl_lib_dir={musl_lib_dir:?}"#));
+    gn_args.push(format!(
+      r#"rusty_v8_musl_libcpp_config_site={musl_libcpp_config_site:?}"#
+    ));
+    gn_args.push("v8_enable_temporal_support=false".to_string());
+    gn_args.push(r#"custom_toolchain="//:clang_x64_musl""#.to_string());
+    gn_args.push(
+      r#"v8_snapshot_toolchain="//build/toolchain/linux:clang_x64""#
+        .to_string(),
+    );
+  }
   if target_arch == "aarch64" {
     gn_args.push(r#"target_cpu="arm64""#.to_string());
-    if target_os == "linux" {
+    if target_os == "linux" && target_env != "musl" {
       gn_args.push("use_sysroot=true".to_string());
       maybe_install_sysroot("arm64");
       maybe_install_sysroot("amd64");
@@ -368,9 +431,11 @@ fn build_v8(is_asan: bool) {
   if target_arch == "arm" {
     gn_args.push(r#"target_cpu="arm""#.to_string());
     gn_args.push(r#"v8_target_cpu="arm""#.to_string());
-    gn_args.push("use_sysroot=true".to_string());
-    maybe_install_sysroot("i386");
-    maybe_install_sysroot("arm");
+    if target_env != "musl" {
+      gn_args.push("use_sysroot=true".to_string());
+      maybe_install_sysroot("i386");
+      maybe_install_sysroot("arm");
+    }
   }
 
   let target_triple = env::var("TARGET").unwrap();
@@ -587,6 +652,29 @@ fn static_checksum_path(path: &Path) -> PathBuf {
 
 fn static_lib_dir() -> PathBuf {
   build_dir().join("gn_out").join("obj")
+}
+
+fn write_musl_libcpp_config_site() -> PathBuf {
+  let original_path = Path::new("buildtools/third_party/libc++/__config_site");
+  let original = fs::read_to_string(original_path).unwrap_or_else(|err| {
+    panic!("failed to read {}: {err}", original_path.display())
+  });
+  let patched = original.replace(
+    "#define _LIBCPP_HAS_MUSL_LIBC 0",
+    "#define _LIBCPP_HAS_MUSL_LIBC 1",
+  );
+  assert_ne!(
+    original,
+    patched,
+    "failed to patch _LIBCPP_HAS_MUSL_LIBC in {}",
+    original_path.display()
+  );
+
+  let out_dir = build_dir().join("musl_overrides");
+  fs::create_dir_all(&out_dir).unwrap();
+  let output_path = out_dir.join("libcpp_config_site.h");
+  fs::write(&output_path, patched).unwrap();
+  output_path
 }
 
 fn build_dir() -> PathBuf {
@@ -892,12 +980,10 @@ fn need_gn_ninja_download() -> bool {
   !has_ninja || !has_gn
 }
 
-// Chromiums gn arg clang_base_path is currently compatible with:
-// * Apples clang and clang from homebrew's llvm@x packages
+// Chromium's gn arg clang_base_path is currently compatible with:
+// * Apple's clang and clang from homebrew's llvm@x packages
 // * the official binaries from releases.llvm.org
-// * unversioned (Linux) packages of clang (if recent enough)
-// but unfortunately it doesn't work with version-suffixed packages commonly
-// found in Linux packet managers
+// * Linux packages of clang exposed via CLANG_BASE_PATH
 fn is_compatible_clang_version(clang_path: &Path) -> bool {
   if let Ok(o) = Command::new(clang_path).arg("--version").output() {
     let _output = String::from_utf8(o.stdout).unwrap();
@@ -907,6 +993,26 @@ fn is_compatible_clang_version(clang_path: &Path) -> bool {
     return true;
   }
   false
+}
+
+fn system_clang_version(base_path: &Path) -> Option<String> {
+  let clang_path = base_path.join("bin").join("clang");
+  let output = Command::new(&clang_path)
+    .arg("-print-resource-dir")
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+
+  let resource_dir = String::from_utf8(output.stdout).ok()?;
+  let resource_dir = Path::new(resource_dir.trim());
+  let parent = resource_dir.parent()?.file_name()?;
+  if parent != "clang" {
+    return None;
+  }
+
+  Some(resource_dir.file_name()?.to_string_lossy().into_owned())
 }
 
 fn find_compatible_system_clang() -> Option<PathBuf> {

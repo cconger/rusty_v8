@@ -1,8 +1,59 @@
 # Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
 import("//build/config/host_byteorder.gni")
+import("//build/toolchain/gcc_toolchain.gni")
 
 declare_args() {
   rusty_v8_enable_simdutf = false
+  rusty_v8_use_musl = false
+  rusty_v8_musl_include_dir = ""
+  rusty_v8_musl_system_include_dir = ""
+  rusty_v8_musl_arch_include_dir = ""
+  rusty_v8_musl_lib_dir = ""
+  rusty_v8_musl_libcpp_config_site = ""
+}
+
+if (rusty_v8_use_musl) {
+  assert(current_os == "linux")
+  assert(current_cpu == "x64")
+  assert(rusty_v8_musl_include_dir != "")
+  assert(rusty_v8_musl_system_include_dir != "")
+  assert(rusty_v8_musl_arch_include_dir != "")
+  assert(rusty_v8_musl_lib_dir != "")
+  assert(rusty_v8_musl_libcpp_config_site != "")
+
+  _musl_clang_builtin_dir =
+      rebase_path("$clang_base_path/lib/clang/$clang_version/include",
+                  root_build_dir)
+  _musl_include_dir = rebase_path(rusty_v8_musl_include_dir, root_build_dir)
+  _musl_system_include_dir =
+      rebase_path(rusty_v8_musl_system_include_dir, root_build_dir)
+  _musl_arch_include_dir =
+      rebase_path(rusty_v8_musl_arch_include_dir, root_build_dir)
+  _musl_lib_dir = rebase_path(rusty_v8_musl_lib_dir, root_build_dir)
+  _musl_libcpp_config_site =
+      rebase_path(rusty_v8_musl_libcpp_config_site, root_build_dir)
+
+  clang_toolchain("clang_x64_musl") {
+    extra_asmflags = "--target=x86_64-unknown-linux-musl"
+    extra_cppflags =
+        "--target=x86_64-unknown-linux-musl -nostdinc " +
+        "-Wno-unused-const-variable " +
+        "-Wno-unused-function " +
+        "-D_LIBCPP_HAS_MUSL_LIBC=1 " +
+        "-include ${_musl_libcpp_config_site} " +
+        "-isystem ${_musl_include_dir} " +
+        "-isystem ${_musl_system_include_dir} " +
+        "-isystem ${_musl_arch_include_dir} " +
+        "-isystem ${_musl_clang_builtin_dir}"
+    extra_ldflags =
+        "--target=x86_64-unknown-linux-musl -fuse-ld=lld " +
+        "-L${_musl_lib_dir} -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1"
+    toolchain_args = {
+      current_cpu = "x64"
+      current_os = "linux"
+      use_sysroot = false
+    }
+  }
 }
 
 static_library("rusty_v8") {
